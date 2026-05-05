@@ -1,0 +1,207 @@
+#pragma kernel CSMain
+
+RWTexture2D<float4> Result;
+
+// Nhận ma trận Camera từ C#
+float4x4 _CameraToWorld;
+float4x4 _CameraInverseProjection;
+
+// 1. Cấu trúc dữ liệu y hệt C#
+struct ObjectData
+{
+    int type;
+    float3 center;
+    float radius;
+    float3 normal;
+    float3 color;
+    int isMirror;
+    float2 size;
+};
+
+struct Ray
+{
+    float3 origin;
+    float3 direction;
+};
+
+struct HitData
+{
+    float distance;
+    float3 hitPoint;
+    float3 normal;
+    float3 color;
+    int isMirror;
+};
+
+// Nhận gói hàng từ C#
+StructuredBuffer<ObjectData> SceneObjects;
+int ObjectCount;
+
+// 2. Hàm tạo tia sáng từ Camera
+Ray CreateCameraRay(float2 uv)
+{
+    float3 origin = mul(_CameraToWorld, float4(0, 0, 0, 1)).xyz;
+    float3 direction = mul(_CameraInverseProjection, float4(uv, 0, 1)).xyz;
+    direction = mul(_CameraToWorld, float4(direction, 0)).xyz;
+    direction = normalize(direction);
+    
+    Ray ray;
+    ray.origin = origin;
+    ray.direction = direction;
+    return ray;
+}
+
+// 3. TOÁN HỌC KHỐI CẦU (Bê nguyên từ MySphereAnswer.cs sang)
+void IntersectSphere(Ray ray, ObjectData obj, inout HitData bestHit)
+{
+    float3 rsVec = obj.center - ray.origin;
+    float rsDotDir = dot(rsVec, ray.direction);
+    if (rsDotDir < 0)
+        return;
+
+    float a = dot(ray.direction, ray.direction);
+    float b = -2.0 * rsDotDir;
+    float c = dot(rsVec, rsVec) - obj.radius * obj.radius;
+    float delta = b * b - 4 * a * c;
+
+    if (delta >= 0)
+    {
+        float dist = (-b - sqrt(delta)) / (2 * a);
+        if (dist > 0.001f && dist < bestHit.distance)
+        { // Epsilon chặn Acne
+            bestHit.distance = dist;
+            bestHit.hitPoint = ray.origin + ray.direction * dist;
+            bestHit.normal = normalize(bestHit.hitPoint - obj.center);
+            bestHit.color = obj.color;
+            bestHit.isMirror = obj.isMirror;
+        }
+    }
+}
+
+// 4. TOÁN HỌC MẶT PHẲNG (Bê nguyên từ MyPlaneAnswer.cs sang)
+void IntersectPlane(Ray ray, ObjectData obj, inout HitData bestHit)
+{
+    float denominator = dot(obj.normal, ray.direction);
+    if (abs(denominator) > 0.0001f)
+    {
+        float3 p0l0 = obj.center - ray.origin;
+        float t = dot(p0l0, obj.normal) / denominator;
+        if (t > 0.001f && t < bestHit.distance)
+        {
+            bestHit.distance = t;
+            bestHit.hitPoint = ray.origin + ray.direction * t;
+            bestHit.normal = normalize(obj.normal);
+            bestHit.color = obj.color;
+            bestHit.isMirror = obj.isMirror;
+        }
+    }
+}
+void IntersectQuad(Ray ray, ObjectData obj, inout HitData bestHit)
+{
+    // 1. Tính toán giao cắt mặt phẳng
+    float denominator = dot(obj.normal, ray.direction);
+    if (abs(denominator) > 0.0001f)
+    {
+        float3 p0l0 = obj.center - ray.origin;
+        float t = dot(p0l0, obj.normal) / denominator;
+        
+        if (t > 0.001f && t < bestHit.distance)
+        {
+            float3 hitPoint = ray.origin + ray.direction * t;
+            float3 localHit = hitPoint - obj.center;
+            
+            // 2. Tính toán trục X (Right) và Y (Up) của gương chiếu hậu
+            float3 upVector = float3(0, 1, 0);
+            float3 rightVector = normalize(cross(upVector, obj.normal));
+            float3 trueUpVector = cross(obj.normal, rightVector);
+            
+            // 3. Chiếu điểm chạm lên trục X và Y để xem có lọt vào khung gương không
+            float x = dot(localHit, rightVector);
+            float y = dot(localHit, trueUpVector);
+            
+            // Nếu lọt vào trong giới hạn kích thước (size)
+            if (abs(x) <= obj.size.x / 2.0 && abs(y) <= obj.size.y / 2.0)
+            {
+                bestHit.distance = t;
+                bestHit.hitPoint = hitPoint;
+                bestHit.normal = denominator < 0 ? obj.normal : -obj.normal;
+                bestHit.color = obj.color;
+                bestHit.isMirror = obj.isMirror;
+            }
+        }
+    }
+}
+// Hàm Trace quét toàn bộ mảng dữ liệu
+HitData Trace(Ray ray)
+{
+    HitData bestHit;
+    bestHit.distance = 1.#INF; // Vô cực
+    
+    for (int i = 0; i < ObjectCount; i++)
+    {
+        if (SceneObjects[i].type == 0)
+            IntersectSphere(ray, SceneObjects[i], bestHit);
+        else if (SceneObjects[i].type == 1)
+            IntersectPlane(ray, SceneObjects[i], bestHit);
+        else if (SceneObjects[i].type == 2)
+            IntersectQuad(ray, SceneObjects[i], bestHit);
+    }
+    return bestHit;
+}
+
+// Khai báo hướng ánh sáng Mặt trời (Bay từ trên chéo xuống)
+float3 _DirectionalLight = normalize(float3(1.0, 1.0, 1.0));
+
+// 5. VÒNG LẶP CSMAIN (Chạy đồng loạt trên hàng triệu Pixel)
+[numthreads(8, 8, 1)]
+void CSMain(uint3 id : SV_DispatchThreadID)
+{
+    uint width, height;
+    Result.GetDimensions(width, height);
+    
+    // Đưa tọa độ Pixel về chuẩn [-1, 1]
+    float2 uv = float2((id.xy + float2(0.5f, 0.5f)) / float2(width, height) * 2.0f - 1.0f);
+    
+    // TIA 1: TIA CAMERA (Từ mắt người nhìn ra màn hình)
+    Ray cameraRay = CreateCameraRay(uv);
+    
+    // Bắn tia Camera xem có đập trúng vật nào không
+    HitData cameraHit = Trace(cameraRay);
+
+    // KẾT QUẢ:
+    if (cameraHit.distance < 1.#INF)
+    {
+        // TRÚNG VẬT THỂ! Bây giờ tính toán đổ bóng.
+        
+        // TIA 2: TIA ĐỔ BÓNG (Từ điểm chạm bắn thẳng về phía Mặt trời)
+        Ray shadowRay;
+        
+        // CỰC KỲ QUAN TRỌNG: Cộng thêm normal * 0.001f để điểm bắn nổi lên bề mặt một chút, 
+        // tránh việc tự đập vào chính mình tạo ra lỗi Shadow Acne (nhiễu hạt).
+        shadowRay.origin = cameraHit.hitPoint + cameraHit.normal * 0.001f;
+        shadowRay.direction = _DirectionalLight;
+        
+        // Bắn tia Shadow đi kiểm tra che khuất
+        HitData shadowHit = Trace(shadowRay);
+        
+        if (shadowHit.distance < 1.#INF)
+        {
+            // BỊ CHE KHUẤT! Tia đổ bóng đập trúng một vật khác trước khi tới Mặt trời.
+            // Vật thể nằm trong bóng râm -> Tô màu tối đi (Nhân với 0.3)
+            Result[id.xy] = float4(cameraHit.color * 0.3f, 1.0);
+        }
+        else
+        {
+            // TẮM NẮNG! Tia đổ bóng bay thẳng tới Mặt trời không bị ai cản.
+            // Vật thể nhận 100% ánh sáng -> Giữ nguyên màu gốc
+            Result[id.xy] = float4(cameraHit.color, 1.0);
+        }
+    }
+    else
+    {
+        // KHÔNG TRÚNG GÌ CẢ: Tia Camera bay tuốt luốt lên trời -> Vẽ Bầu Trời
+        float t = 0.5 * (cameraRay.direction.y + 1.0);
+        float3 skyColor = lerp(float3(1, 1, 1), float3(0.5, 0.7, 1.0), t);
+        Result[id.xy] = float4(skyColor, 1.0);
+    }
+}
