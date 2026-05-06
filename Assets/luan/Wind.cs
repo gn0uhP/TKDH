@@ -2,18 +2,18 @@ using UnityEngine;
 
 public class Wind : MonoBehaviour
 {
-    public float speed = 1f;
+    public float speed = 2f;
     public float amp = 3f;
-    private Quaternion g;
+    private float offset;
 
     void Start()
     {
-        g = transform.rotation;
+        offset = Random.Range(0f, 10f);
     }
 
     void Update()
     {
-        float a = Mathf.Sin(Time.time * speed) * amp;
-        transform.rotation = g * Quaternion.Euler(a, 0, a);
+        float angle = Mathf.Sin((Time.time + offset) * speed) * amp;
+        transform.localRotation = Quaternion.Euler(angle, 0, 0);
     }
 }
